@@ -58,13 +58,17 @@ public class LineAdjustmentAlgorithm
 
     private static StringBuilder JustifyLine(ReadOnlySpan<char> src, List<Range> ranges, int lineWidth)
     {
+        var spacesMax = new string(' ', lineWidth).AsSpan();
+
         var capacity = ranges.Sum(r => r.End.Value - r.Start.Value);
 
         var result = new StringBuilder(capacity);
 
+        result.Append(src[ranges[0]]);
+
         if (ranges.Count == 1)
         {
-            return result.Append(src[ranges[0]]).Append(new string(' ', lineWidth - src[ranges[0]].Length));
+            return result.Append(spacesMax[..(lineWidth - src[ranges[0]].Length)]);
         }
 
         var totalSpaces = lineWidth - capacity;
@@ -72,18 +76,16 @@ public class LineAdjustmentAlgorithm
 
         if (spaceSlots <= 0)
         {
-            return result.Append(src[ranges[0]]).Append(new string(' ', totalSpaces));
+            return result.Append(spacesMax[..totalSpaces]);
         }
 
         var spaceBetweenWords = totalSpaces / spaceSlots;
         var extraSpaces = totalSpaces % spaceSlots;
 
-        result.Append(src[ranges[0]]);
-
         for (var i = 1; i < ranges.Count; i++)
         {
             var spaces = spaceBetweenWords + (i <= extraSpaces ? 1 : 0);
-            result.Append(new string(' ', spaces));
+            result.Append(spacesMax[..spaces]);
             result.Append(src[ranges[i]]);
         }
 
