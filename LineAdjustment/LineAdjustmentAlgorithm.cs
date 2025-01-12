@@ -2,81 +2,114 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
+using Microsoft.Extensions.ObjectPool;
 
 namespace LineAdjustment;
 
 public class LineAdjustmentAlgorithm
 {
+    private readonly ObjectPool<StringBuilder> _stringBuilderPool;
+
+    public LineAdjustmentAlgorithm(ObjectPool<StringBuilder> stringBuilderPool)
+    {
+        _stringBuilderPool = stringBuilderPool;
+    }
+
+    public bool UseSpaceCache { get; init; }
+
+    /// <exception cref="ArgumentOutOfRangeException">Если заданная длинна отрицательная</exception>
+    /// <exception cref="InvalidOperationException">Длина слова превышает максимальную ширину стоки</exception>
     public string Transform(string input, int lineWidth)
     {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(lineWidth);
+
         if (string.IsNullOrEmpty(input))
         {
             return string.Empty;
         }
 
-        var linesBuilder = new StringBuilder(input.Length * 2);
-
-        //Span<Range> ranges = stackalloc Range[input.Length];
-        var inputSpan = input.AsSpan();
-        // var cnt = inputSpan.Split(ranges, [' '], StringSplitOptions.RemoveEmptyEntries);
-        var ranges = inputSpan.Split(' ');
-
-        var currentLineRanges = new List<Range>(input.Length);
-        var currentLength = 0;
-
-        foreach (var range in ranges)
-        {
-            var word = inputSpan[range];
-            var wordLength = word.Length;
-            if (wordLength == 0)
-            {
-                continue;
-            }
-
-            if (currentLength + wordLength + currentLineRanges.Count <= lineWidth)
-            {
-                currentLineRanges.Add(range);
-                currentLength += wordLength;
-            }
-            else
-            {
-                var justifyLine = JustifyLine(inputSpan, currentLineRanges, lineWidth);
-
-                linesBuilder.Append(justifyLine).Append('\n');
-
-                currentLineRanges.Clear();
-                currentLineRanges.Add(range);
-                currentLength = wordLength;
-            }
-        }
-
-        var lastLine = JustifyLine(inputSpan, currentLineRanges, lineWidth);
-        linesBuilder.Append(lastLine);
-
-        return linesBuilder.ToString();
+        return Transform(input.AsSpan(), lineWidth);
     }
 
-    private static StringBuilder JustifyLine(ReadOnlySpan<char> src, List<Range> ranges, int lineWidth)
+    /// <exception cref="InvalidOperationException">Длина слова превышает максимальную ширину стоки</exception>
+    private string Transform(ReadOnlySpan<char> input, int lineWidth)
     {
-        var spacesMax = new string(' ', lineWidth).AsSpan();
+        var linesBuilder = _stringBuilderPool.Get();
+        linesBuilder.Clear();
+        linesBuilder.Capacity = input.Length * 2;
 
-        var capacity = ranges.Sum(r => r.End.Value - r.Start.Value);
+        try
+        {
+            var ranges = input.Split(' ');
 
-        var result = new StringBuilder(capacity);
+            var currentLineRanges = new List<Range>();
+            var currentLength = 0;
 
-        result.Append(src[ranges[0]]);
+            foreach (var range in ranges)
+            {
+                var wordLength = range.GetOffsetAndLength(input.Length).Length;
+                if (wordLength == 0)
+                {
+                    continue;
+                }
+
+                if (wordLength > lineWidth)
+                {
+                    throw new InvalidOperationException($"Word length exceeds Line width: {input[range]}");
+                }
+
+                if (currentLength + wordLength + currentLineRanges.Count <= lineWidth)
+                {
+                    currentLineRanges.Add(range);
+                    currentLength += wordLength;
+                }
+                else
+                {
+                    linesBuilder = JustifyLine(input, currentLineRanges, linesBuilder, lineWidth)
+                        .Append('\n');
+
+                    currentLineRanges.Clear();
+                    currentLineRanges.Add(range);
+                    currentLength = wordLength;
+                }
+            }
+
+            return JustifyLine(input, currentLineRanges, linesBuilder, lineWidth)
+                .ToString();
+        }
+        finally
+        {
+            _stringBuilderPool.Return(linesBuilder);
+        }
+    }
+
+    private StringBuilder JustifyLine(ReadOnlySpan<char> src, List<Range> ranges, StringBuilder dst, int lineWidth)
+    {
+        if (UseSpaceCache)
+        {
+            return JustifyLineCache(src, ranges, dst, lineWidth);
+        }
+
+        return JustifyLineNoCache(src, ranges, dst, lineWidth);
+    }
+
+    private static StringBuilder JustifyLineNoCache(ReadOnlySpan<char> src, List<Range> ranges, StringBuilder dst, int lineWidth)
+    {
+        dst.Append(src[ranges[0]]);
 
         if (ranges.Count == 1)
         {
-            return result.Append(spacesMax[..(lineWidth - src[ranges[0]].Length)]);
+            return dst.Append(' ', lineWidth - src[ranges[0]].Length);
         }
 
+        var srcLenght = src.Length;
+        var capacity = ranges.Sum(r => r.GetOffsetAndLength(srcLenght).Length);
         var totalSpaces = lineWidth - capacity;
         var spaceSlots = ranges.Count - 1;
 
         if (spaceSlots <= 0)
         {
-            return result.Append(spacesMax[..totalSpaces]);
+            return dst.Append(' ', totalSpaces);
         }
 
         var spaceBetweenWords = totalSpaces / spaceSlots;
@@ -85,10 +118,45 @@ public class LineAdjustmentAlgorithm
         for (var i = 1; i < ranges.Count; i++)
         {
             var spaces = spaceBetweenWords + (i <= extraSpaces ? 1 : 0);
-            result.Append(spacesMax[..spaces]);
-            result.Append(src[ranges[i]]);
+            dst.Append(' ', spaces);
+            dst.Append(src[ranges[i]]);
         }
 
-        return result;
+        return dst;
+    }
+
+    private static StringBuilder JustifyLineCache(ReadOnlySpan<char> src, List<Range> ranges, StringBuilder dst, int lineWidth)
+    {
+        Span<char> spacesMax = stackalloc char[lineWidth];
+        spacesMax.Fill(' ');
+
+        dst.Append(src[ranges[0]]);
+
+        if (ranges.Count == 1)
+        {
+            return dst.Append(spacesMax[..(lineWidth - src[ranges[0]].Length)]);
+        }
+
+        var srcLenght = src.Length;
+        var capacity = ranges.Sum(r => r.GetOffsetAndLength(srcLenght).Length);
+        var totalSpaces = lineWidth - capacity;
+        var spaceSlots = ranges.Count - 1;
+
+        if (spaceSlots <= 0)
+        {
+            return dst.Append(spacesMax[..totalSpaces]);
+        }
+
+        var spaceBetweenWords = totalSpaces / spaceSlots;
+        var extraSpaces = totalSpaces % spaceSlots;
+
+        for (var i = 1; i < ranges.Count; i++)
+        {
+            var spaces = spaceBetweenWords + (i <= extraSpaces ? 1 : 0);
+            dst.Append(spacesMax[..spaces]);
+            dst.Append(src[ranges[i]]);
+        }
+
+        return dst;
     }
 }
